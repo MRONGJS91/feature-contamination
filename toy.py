@@ -34,7 +34,10 @@ mlp_freeze_output = False     # whether to freeze the output layer of MLP
 # training parameters
 gid           = 0        # GPU ID
 train_iters   = 20000    # training iterations
-learning_rate = 1e-3
+# Learning rate sweep (for analysis of feature contamination)
+lr_list = [0.001, 0.005, 0.01, 0.05, 0.1]
+ood_results = []
+
 weight_decay  = 1e-3
 
 # plot settings
@@ -163,55 +166,84 @@ def main():
     set_seed(seed)
     device = torch.device(f'cuda:{gid}' if torch.cuda.is_available() else 'cpu')
     
-    model = MLP(in_features=input_dim, hidden_features=hidden_dim).train().to(device)
-    optimizer = get_optimizer(model)
-    loss_func = get_loss()
+    # ===== Learning rate sweep =====
+    lr_list = [0.001, 0.005, 0.01, 0.05, 0.1]
+    final_ood_losses = []
     
+    # 数据只生成一次（保持一致）
     input_transform = random_orthogonal_transform(core_dim + bg_dim, input_dim)
     train_x, test_x, y = generate_data(input_transform)
     train_x = train_x.to(device)
     test_x = test_x.to(device)
     y = y.to(device)
     
-    # Training
-    train_losses = []
-    eval_losses = []
-    corr_core = []
-    corr_spu = []
+    loss_func = get_loss()
     
-    for i in tqdm(range(train_iters)):
-        pred = model(train_x)
-        loss = loss_func(pred.squeeze(), y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    for lr in lr_list:
+        print("\n===================================")
+        print(f"Running experiment with lr = {lr}")
+        print("===================================")
         
-        if i % print_freq == 0 or i == train_iters - 1:
-            eval_loss = evaluate(model, test_x, y, loss_func)
-            train_losses.append(loss.item())
-            eval_losses.append(eval_loss)
-            print(f'Training iteration {i}: train loss = {loss.item():.4f}, eval loss = {eval_loss:.4f}')
-            if plot_corr:
-                weight = model.fcs[0].weight.cpu().detach()
-                weight = weight @ input_transform.T
-                corr_core.append(LA.norm(weight[:, :core_dim], dim=-1).mean().item())
-                corr_spu.append(LA.norm(weight[:, core_dim:], dim=-1).mean().item())
+        # ===== 关键：设置当前学习率 =====
+        global learning_rate
+        learning_rate = lr   # 如果 get_optimizer() 里用的是这个变量
+        
+        # ===== 重新初始化模型 =====
+        model = MLP(in_features=input_dim, hidden_features=hidden_dim).train().to(device)
+        optimizer = get_optimizer(model)
+        
+        train_losses = []
+        eval_losses = []
+        corr_core = []
+        corr_spu = []
+        
+        # ===== Training =====
+        for i in tqdm(range(train_iters)):
+            pred = model(train_x)
+            loss = loss_func(pred.squeeze(), y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            if i % print_freq == 0 or i == train_iters - 1:
+                eval_loss = evaluate(model, test_x, y, loss_func)
+                train_losses.append(loss.item())
+                eval_losses.append(eval_loss)
+                
+                if i == train_iters - 1:
+                    print(f'Final eval loss (OOD) for lr={lr}: {eval_loss:.4f}')
+                
+                if plot_corr:
+                    weight = model.fcs[0].weight.cpu().detach()
+                    weight = weight @ input_transform.T
+                    corr_core.append(LA.norm(weight[:, :core_dim], dim=-1).mean().item())
+                    corr_spu.append(LA.norm(weight[:, core_dim:], dim=-1).mean().item())
+        
+        # 记录最终OOD
+        final_ood_losses.append(eval_losses[-1])
+        
+        # 保存每个lr的结果
+        lr_save_dir = os.path.join(save_dir, f"lr_{lr}")
+        if not os.path.exists(lr_save_dir):
+            os.makedirs(lr_save_dir)
+        
+        np.savez(os.path.join(lr_save_dir, f'{loss_name}_{opt}_{mlp_act}.npz'),
+                 train_loss=np.array(train_losses),
+                 eval_loss=np.array(eval_losses),
+                 corr_core=np.array(corr_core),
+                 corr_spu=np.array(corr_spu))
     
-    train_losses = np.array(train_losses)
-    eval_losses = np.array(eval_losses)
-    corr_core = np.array(corr_core)
-    corr_spu = np.array(corr_spu)
+    # ===== 画 Learning Rate vs OOD =====
+    import matplotlib.pyplot as plt
     
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    # save stats
-    np.savez(os.path.join(save_dir, f'{loss_name}_{opt}_{mlp_act}.npz'),
-             train_loss=train_losses, eval_loss=eval_losses,
-             corr_core=corr_core, corr_spu=corr_spu)
-    
-    # plot
-    plot_loss_and_weights(train_losses, eval_losses, corr_core, corr_spu)
+    plt.figure()
+    plt.plot(lr_list, final_ood_losses, marker='o')
+    plt.xscale('log')
+    plt.xlabel('Learning Rate')
+    plt.ylabel('Final OOD Loss')
+    plt.title('Effect of Learning Rate on Feature Contamination')
+    plt.grid(True)
+    plt.show()
 
 
 def plot_multiple_activations():
